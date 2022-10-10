@@ -4,9 +4,11 @@
 
 
 ```python
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
+import aesara.tensor as at
 import arviz as az
 import janitor  # noqa: F401
 import matplotlib.pyplot as plt
@@ -48,17 +50,17 @@ class TumoroscopeData:
 
     K: int  # number of clones
     S: int  # number of spots
-    P: int  # number of mutation positions
+    M: int  # number of mutation positions
     F: np.ndarray  # Prevelance of clones from bulk-DNA seq.
     Lambda: np.ndarray  # Number of cell counted per spot
     C: np.ndarray  # Zygosity per position and clone
     D_obs: np.ndarray | None  # Read count per position per spot
     A_obs: np.ndarray | None  # Alternated reads per position per spot
-    zeta_s: float = 1  # Pi hyper-parameter
+    zeta_s: float = 1.0  # Pi hyper-parameter
     F_0: float = 0.01  # "pseudo-frequency" for lower bound on clone proportion
     l: float = 100  # Scaling factor to discretize F
     r: float = 0.09  # shape parameter for Gamma over Phi
-    p: float = 1  # rate parameter for Gamma over Phi
+    p: float = 1.0  # rate parameter for Gamma over Phi
 
 
 def _prefixed_index(n: int, prefix: str) -> list[str]:
@@ -66,16 +68,35 @@ def _prefixed_index(n: int, prefix: str) -> list[str]:
 
 
 def _check_tumoroscope_data(data: TumoroscopeData) -> None:
+    assert data.K > 0 and data.S > 0 and data.M > 0
+
     assert data.F.sum() == 1.0
     assert data.F.ndim == 1
     assert data.F.shape[0] == data.K
+
+    assert data.Lambda.shape == (data.S,)
+    assert np.all(data.Lambda > 0)
+
+    assert np.all(data.C >= 0.0) and np.all(data.C <= 1.0)
+    assert data.C.shape == (data.M, data.K)
+
+    if data.D_obs is not None:
+        assert data.D_obs.shape == (data.M, data.S)
+
+    if data.A_obs is not None:
+        assert data.A_obs.shape == (data.M, data.S)
+
+    assert data.zeta_s > 0.0
+    assert data.F_0 > 0.0
+    assert data.l > 0.0
+    assert data.r > 0.0 and data.p > 0.0
 
 
 def _make_tumoroscope_model_coords(data: TumoroscopeData) -> dict[str, list[str]]:
     coords = {
         "clone": _prefixed_index(data.K, "c"),
         "spot": _prefixed_index(data.S, "s"),
-        "position": _prefixed_index(data.P, "p"),
+        "position": _prefixed_index(data.M, "p"),
     }
     return coords
 
@@ -94,9 +115,9 @@ def tumoroscope(data: TumoroscopeData) -> pm.Model:
         p = pm.ConstantData("p", data.p)
         C = pm.ConstantData("C", data.C, dims=("position", "clone"))
 
-        F_prime = pm.Deterministic("F_prime", ℓ * 20 * F / 20, dims="clone")
+        F_prime = pm.Deterministic("F_prime", ℓ * at.ceil(20 * F) / 20, dims="clone")
 
-        Π = pm.Beta("Π", alpha=ζ_s, beta=1, dims=("spot", "clone"))
+        Π = pm.Beta("Π", alpha=ζ_s / data.K, beta=1, dims=("spot", "clone"))
         Z = pm.Bernoulli("Z", p=Π, dims=("spot", "clone"))  # , initval=_Z_init)
         G = pm.Gamma("G", (F_prime**Z) * (F_0 ** (1 - Z)), 1, dims=("spot", "clone"))
         H = pm.Deterministic("H", G / G.sum(axis=1)[:, None], dims=("spot", "clone"))
@@ -108,11 +129,9 @@ def tumoroscope(data: TumoroscopeData) -> pm.Model:
         )
 
         _A_num = pm.Deterministic(
-            "A_num", H[:, 1:].dot((Φ[:, 1:] * C[:, 1:]).T).T, dims=("position", "spot")
+            "A_num", H.dot((Φ * C).T).T, dims=("position", "spot")
         )
-        _A_denom = pm.Deterministic(
-            "A_denom", H[:, 1:].dot(Φ[:, 1:].T).T, dims=("position", "spot")
-        )
+        _A_denom = pm.Deterministic("A_denom", H.dot(Φ.T).T, dims=("position", "spot"))
         A = pm.Binomial(
             "A", D, _A_num / _A_denom, dims=("position", "spot"), observed=data.A_obs
         )
@@ -125,7 +144,7 @@ np.random.seed(234)
 mock_tumor_data = TumoroscopeData(
     K=5,
     S=10,
-    P=40,
+    M=40,
     F=np.ones(5) / 5.0,
     Lambda=np.random.randint(1, 20, size=10),
     C=np.random.beta(2, 2, size=(40, 5)),
@@ -146,15 +165,12 @@ pm.model_to_graphviz(m)
 
 
 
-To-Do:
-
-- generate mock data and test model
-- try to use Dirichlet for $P(H|F^\prime,F_0,Z)$ like the Methods explains
-
 Possible improvements
 
 - explore prior distributions over the current user-supplied hyper-parameters
 - utilize spatial relationships in the estimation of clonal distributions per spot
+- a hierarchical structure to share information
+- try to use Dirichlet for $P(H|F^\prime,F_0,Z)$ like the Methods explains
 
 ## Prior predictive sampling
 
@@ -163,7 +179,7 @@ Possible improvements
 example_input_data = TumoroscopeData(
     K=5,
     S=10,
-    P=40,
+    M=40,
     F=np.array([0.01, 0.05, 0.15, 0.3, 0.49]),
     Lambda=np.ones(10) * 5,
     C=np.ones((40, 5), float),
@@ -263,8 +279,8 @@ prior_pred.prior["D"].mean(axis=(0, 1)).sum(axis=0).values
 
 
 
-    array([36.912, 38.294, 36.97 , 37.696, 37.998, 38.878, 37.838, 37.492,
-           37.948, 38.102])
+    array([37.496, 38.722, 36.512, 38.574, 38.528, 38.484, 37.55 , 37.6  ,
+           37.568, 39.028])
 
 
 
@@ -289,7 +305,7 @@ plt.show()
 ```python
 _, ax = plt.subplots(figsize=(4, 2))
 x = np.linspace(0, 1, 500)
-y = scipy.stats.beta(1, 3).pdf(x)
+y = scipy.stats.beta(2, 1).pdf(x)
 ax.plot(x, y)
 plt.show()
 ```
@@ -536,7 +552,7 @@ clone_mutations.shape
 
 # Randomly assign zygosity per position for each clone.
 # zygosity = np.random.beta(10, 1, size=(n_positions, N_CLONES))
-zygosity = np.ones((n_positions, N_CLONES))
+zygosity = clone_mutations.copy()
 print(f"average zygosity: {zygosity.mean():0.2f}")
 
 # For each cell in each spot, sample some number of reads for each position.
@@ -557,7 +573,7 @@ tot_read_counts = tot_read_counts.sum(axis=2)
 alt_read_counts.shape
 ```
 
-    average zygosity: 1.00
+    average zygosity: 0.50
 
 
 
@@ -599,8 +615,8 @@ tot_read_counts.sum(axis=0).round(2)
 
 
 
-    array([188., 182., 195., 194., 187., 398., 180., 177., 419., 389., 212.,
-           407., 420., 397., 192., 432., 207., 230., 210., 211.])
+    array([177., 170., 174., 164., 183., 392., 203., 172., 397., 385., 195.,
+           403., 394., 416., 223., 389., 196., 178., 236., 226.])
 
 
 
@@ -609,25 +625,71 @@ tot_read_counts.sum(axis=0).round(2)
 sim_data = TumoroscopeData(
     K=N_CLONES,
     S=N_SPOTS,
-    P=n_positions,
+    M=n_positions,
     F=F,
     Lambda=cell_counts,
     C=zygosity,
     D_obs=tot_read_counts,
     A_obs=alt_read_counts,
-    zeta_s=N_CLONES,
+    zeta_s=N_CLONES * 2,
 )
 
 sim_trace_fp = models_dir / "simulation-trace.netcdf"
+
+if True and sim_trace_fp.exists():
+    print("Removing trace cache.")
+    os.remove(sim_trace_fp)
+
 if sim_trace_fp.exists():
     sim_trace = az.from_netcdf(sim_trace_fp)
 else:
     with tumoroscope(sim_data):
         sim_trace = pm.sample(
-            draws=500, tune=1000, chains=2, cores=2, random_seed=10, target_accept=0.9
+            draws=500, tune=1000, chains=2, cores=2, random_seed=10, target_accept=0.95
         )
     sim_trace.to_netcdf(sim_trace_fp)
 ```
+
+    Multiprocess sampling (2 chains in 2 jobs)
+    CompoundStep
+    >NUTS: [Π, G, Φ]
+    >BinaryGibbsMetropolis: [Z]
+    >Metropolis: [N]
+
+
+
+
+<style>
+    /* Turns off some styling */
+    progress {
+        /* gets rid of default border in Firefox and Opera. */
+        border: none;
+        /* Needs to be in here for Safari polyfill so background images work as expected. */
+        background-size: auto;
+    }
+    progress:not([value]), progress:not([value])::-webkit-progress-bar {
+        background: repeating-linear-gradient(45deg, #7e7e7e, #7e7e7e 10px, #5c5c5c 10px, #5c5c5c 20px);
+    }
+    .progress-bar-interrupted, .progress-bar-interrupted::-webkit-progress-bar {
+        background: #F44336;
+    }
+</style>
+
+
+
+
+
+<div>
+  <progress value='3000' class='' max='3000' style='width:300px; height:20px; vertical-align: middle;'></progress>
+  100.00% [3000/3000 08:51&lt;00:00 Sampling 2 chains, 25 divergences]
+</div>
+
+
+
+    Sampling 2 chains for 1_000 tune and 500 draw iterations (2_000 + 1_000 draws total) took 551 seconds.
+    There were 13 divergences after tuning. Increase `target_accept` or reparameterize.
+    There were 12 divergences after tuning. Increase `target_accept` or reparameterize.
+
 
 
 ```python
@@ -635,23 +697,45 @@ n_divs = sim_trace.sample_stats.diverging.sum(axis=1).values
 print(f"Number of divergences per chain: {n_divs}")
 ```
 
-    Number of divergences per chain: [13 22]
+    Number of divergences per chain: [13 12]
 
 
 
 ```python
+def _frac_clone(s: pd.Series, k: int) -> float:
+    return np.mean(s == k)
+
+
 fig, axes = plt.subplots(nrows=sim_data.K, figsize=(5, 2.5 * sim_data.K))
 for clone_i, ax in enumerate(axes.flatten()):
     clone = f"c{clone_i}"
     ax.set_title(clone)
+
+    # Plot true fraction of clones at each spot.
+    true_clone_frac = cell_labels.groupby(["spot"])["clone"].apply(
+        _frac_clone, k=clone_i
+    )
+    ax.scatter(
+        true_clone_frac.index.tolist(),
+        true_clone_frac.values.tolist(),
+        c="tab:blue",
+        s=8,
+        zorder=10,
+    )
+
+    # Plot true underlying proportion of clones at each spot.
     spot = np.arange(sim_data.S)
-    ax.scatter(spot, clone_proportions[:, clone_i], c="k", s=5, zorder=5)
+    ax.plot(spot, clone_proportions[:, clone_i], c="tab:grey", lw=1, zorder=5)
+
+    # Plot posterior.
     H = sim_trace.posterior["H"].sel(clone=[clone])
+    dx = np.linspace(-0.1, 0.1, len(H.coords["chain"]))
     for chain in H.coords["chain"]:
-        ax.scatter(spot, H.sel(chain=chain).mean(axis=(0)), c="tab:red", s=2, zorder=20)
+        _x = spot + dx[chain]
+        ax.scatter(_x, H.sel(chain=chain).mean(axis=(0)), c="tab:red", s=2, zorder=20)
         _hdi = az.hdi(H, coords={"chain": [chain]})["H"].values.squeeze()
         ax.vlines(
-            x=spot, ymin=_hdi[:, 0], ymax=_hdi[:, 1], lw=0.5, zorder=10, color="tab:red"
+            x=_x, ymin=_hdi[:, 0], ymax=_hdi[:, 1], lw=0.5, zorder=10, color="tab:red"
         )
 
 fig.tight_layout()
@@ -680,6 +764,10 @@ plt.tight_layout()
 ```python
 az.summary(sim_trace, var_names=["N"]).assign(real_values=sim_data.Lambda)
 ```
+
+    /usr/local/Caskroom/miniconda/base/envs/pymc-tumoroscope/lib/python3.10/site-packages/arviz/stats/diagnostics.py:586: RuntimeWarning: invalid value encountered in double_scalars
+      (between_chain_variance / within_chain_variance + num_samples - 1) / (num_samples)
+
 
 
 
@@ -717,262 +805,262 @@ az.summary(sim_trace, var_names=["N"]).assign(real_values=sim_data.Lambda)
   <tbody>
     <tr>
       <th>N[s0]</th>
-      <td>3.341</td>
-      <td>0.501</td>
+      <td>3.012</td>
+      <td>0.109</td>
       <td>3.0</td>
-      <td>4.0</td>
-      <td>0.262</td>
-      <td>0.203</td>
-      <td>4.0</td>
-      <td>4.0</td>
-      <td>1.55</td>
+      <td>3.0</td>
+      <td>0.009</td>
+      <td>0.006</td>
+      <td>142.0</td>
+      <td>142.0</td>
+      <td>1.01</td>
       <td>4</td>
     </tr>
     <tr>
       <th>N[s1]</th>
-      <td>3.077</td>
-      <td>0.267</td>
+      <td>3.004</td>
+      <td>0.063</td>
       <td>3.0</td>
       <td>3.0</td>
-      <td>0.073</td>
-      <td>0.053</td>
-      <td>13.0</td>
-      <td>13.0</td>
-      <td>1.14</td>
+      <td>0.002</td>
+      <td>0.002</td>
+      <td>672.0</td>
+      <td>672.0</td>
+      <td>1.00</td>
       <td>5</td>
     </tr>
     <tr>
       <th>N[s2]</th>
-      <td>2.969</td>
-      <td>0.210</td>
+      <td>3.009</td>
+      <td>0.105</td>
       <td>3.0</td>
       <td>3.0</td>
-      <td>0.031</td>
-      <td>0.022</td>
-      <td>61.0</td>
-      <td>373.0</td>
-      <td>1.06</td>
+      <td>0.007</td>
+      <td>0.005</td>
+      <td>212.0</td>
+      <td>189.0</td>
+      <td>1.01</td>
       <td>3</td>
     </tr>
     <tr>
       <th>N[s3]</th>
-      <td>3.065</td>
-      <td>0.247</td>
+      <td>3.000</td>
+      <td>0.000</td>
       <td>3.0</td>
       <td>3.0</td>
-      <td>0.053</td>
-      <td>0.038</td>
-      <td>22.0</td>
-      <td>22.0</td>
-      <td>1.07</td>
+      <td>0.000</td>
+      <td>0.000</td>
+      <td>1000.0</td>
+      <td>1000.0</td>
+      <td>NaN</td>
       <td>6</td>
     </tr>
     <tr>
       <th>N[s4]</th>
-      <td>3.056</td>
-      <td>0.230</td>
+      <td>3.036</td>
+      <td>0.186</td>
       <td>3.0</td>
       <td>3.0</td>
-      <td>0.048</td>
-      <td>0.035</td>
-      <td>23.0</td>
-      <td>23.0</td>
-      <td>1.10</td>
+      <td>0.012</td>
+      <td>0.009</td>
+      <td>225.0</td>
+      <td>225.0</td>
+      <td>1.01</td>
       <td>5</td>
     </tr>
     <tr>
       <th>N[s5]</th>
-      <td>11.667</td>
-      <td>1.290</td>
-      <td>10.0</td>
-      <td>13.0</td>
-      <td>0.686</td>
-      <td>0.532</td>
-      <td>4.0</td>
-      <td>6.0</td>
-      <td>1.60</td>
+      <td>9.902</td>
+      <td>0.767</td>
+      <td>9.0</td>
+      <td>11.0</td>
+      <td>0.144</td>
+      <td>0.105</td>
+      <td>29.0</td>
+      <td>79.0</td>
+      <td>1.07</td>
       <td>5</td>
     </tr>
     <tr>
       <th>N[s6]</th>
-      <td>2.990</td>
-      <td>0.403</td>
-      <td>2.0</td>
+      <td>3.619</td>
+      <td>0.490</td>
       <td>3.0</td>
-      <td>0.143</td>
-      <td>0.107</td>
-      <td>8.0</td>
-      <td>20.0</td>
-      <td>1.18</td>
+      <td>4.0</td>
+      <td>0.060</td>
+      <td>0.042</td>
+      <td>69.0</td>
+      <td>66.0</td>
+      <td>1.02</td>
       <td>6</td>
     </tr>
     <tr>
       <th>N[s7]</th>
-      <td>2.977</td>
-      <td>0.220</td>
+      <td>3.002</td>
+      <td>0.045</td>
       <td>3.0</td>
       <td>3.0</td>
-      <td>0.029</td>
-      <td>0.021</td>
-      <td>60.0</td>
-      <td>261.0</td>
-      <td>1.04</td>
+      <td>0.001</td>
+      <td>0.001</td>
+      <td>1011.0</td>
+      <td>1011.0</td>
+      <td>1.00</td>
       <td>4</td>
     </tr>
     <tr>
       <th>N[s8]</th>
-      <td>10.626</td>
-      <td>1.017</td>
+      <td>10.003</td>
+      <td>0.861</td>
       <td>9.0</td>
+      <td>11.0</td>
+      <td>0.252</td>
+      <td>0.183</td>
       <td>12.0</td>
-      <td>0.452</td>
-      <td>0.340</td>
-      <td>5.0</td>
-      <td>19.0</td>
-      <td>1.35</td>
+      <td>23.0</td>
+      <td>1.13</td>
       <td>2</td>
     </tr>
     <tr>
       <th>N[s9]</th>
-      <td>11.757</td>
-      <td>1.345</td>
+      <td>10.068</td>
+      <td>0.756</td>
       <td>9.0</td>
-      <td>13.0</td>
-      <td>0.755</td>
-      <td>0.592</td>
-      <td>3.0</td>
-      <td>9.0</td>
-      <td>1.66</td>
+      <td>11.0</td>
+      <td>0.197</td>
+      <td>0.142</td>
+      <td>15.0</td>
+      <td>41.0</td>
+      <td>1.10</td>
       <td>5</td>
     </tr>
     <tr>
       <th>N[s10]</th>
-      <td>8.093</td>
-      <td>1.799</td>
+      <td>6.471</td>
+      <td>0.655</td>
       <td>6.0</td>
-      <td>10.0</td>
-      <td>1.146</td>
-      <td>0.932</td>
-      <td>3.0</td>
-      <td>3.0</td>
-      <td>2.07</td>
+      <td>7.0</td>
+      <td>0.132</td>
+      <td>0.096</td>
+      <td>26.0</td>
+      <td>34.0</td>
+      <td>1.07</td>
       <td>3</td>
     </tr>
     <tr>
       <th>N[s11]</th>
-      <td>11.996</td>
-      <td>1.434</td>
-      <td>10.0</td>
-      <td>14.0</td>
-      <td>0.767</td>
-      <td>0.595</td>
-      <td>4.0</td>
+      <td>10.346</td>
+      <td>0.823</td>
       <td>9.0</td>
-      <td>1.60</td>
+      <td>11.0</td>
+      <td>0.154</td>
+      <td>0.111</td>
+      <td>30.0</td>
+      <td>74.0</td>
+      <td>1.06</td>
       <td>5</td>
     </tr>
     <tr>
       <th>N[s12]</th>
-      <td>10.505</td>
-      <td>1.119</td>
+      <td>10.314</td>
+      <td>0.837</td>
       <td>9.0</td>
-      <td>12.0</td>
-      <td>0.582</td>
-      <td>0.449</td>
-      <td>4.0</td>
-      <td>6.0</td>
-      <td>1.52</td>
+      <td>11.0</td>
+      <td>0.228</td>
+      <td>0.165</td>
+      <td>13.0</td>
+      <td>42.0</td>
+      <td>1.12</td>
       <td>7</td>
     </tr>
     <tr>
       <th>N[s13]</th>
-      <td>12.601</td>
-      <td>1.513</td>
-      <td>10.0</td>
-      <td>14.0</td>
-      <td>0.820</td>
-      <td>0.638</td>
-      <td>3.0</td>
-      <td>64.0</td>
-      <td>1.62</td>
+      <td>10.451</td>
+      <td>0.806</td>
+      <td>9.0</td>
+      <td>11.0</td>
+      <td>0.142</td>
+      <td>0.103</td>
+      <td>35.0</td>
+      <td>125.0</td>
+      <td>1.05</td>
       <td>5</td>
     </tr>
     <tr>
       <th>N[s14]</th>
-      <td>7.301</td>
-      <td>1.599</td>
-      <td>5.0</td>
-      <td>9.0</td>
-      <td>1.038</td>
-      <td>0.850</td>
-      <td>3.0</td>
-      <td>5.0</td>
-      <td>2.16</td>
+      <td>7.207</td>
+      <td>0.698</td>
+      <td>6.0</td>
+      <td>8.0</td>
+      <td>0.107</td>
+      <td>0.077</td>
+      <td>43.0</td>
+      <td>97.0</td>
+      <td>1.06</td>
       <td>2</td>
     </tr>
     <tr>
       <th>N[s15]</th>
-      <td>11.237</td>
-      <td>1.222</td>
+      <td>9.958</td>
+      <td>0.723</td>
       <td>9.0</td>
-      <td>13.0</td>
-      <td>0.619</td>
-      <td>0.476</td>
-      <td>4.0</td>
-      <td>45.0</td>
-      <td>1.54</td>
+      <td>11.0</td>
+      <td>0.157</td>
+      <td>0.112</td>
+      <td>21.0</td>
+      <td>38.0</td>
+      <td>1.09</td>
       <td>5</td>
     </tr>
     <tr>
       <th>N[s16]</th>
-      <td>8.406</td>
-      <td>1.864</td>
+      <td>6.389</td>
+      <td>0.651</td>
       <td>6.0</td>
-      <td>11.0</td>
-      <td>1.214</td>
-      <td>0.995</td>
-      <td>3.0</td>
-      <td>6.0</td>
-      <td>2.06</td>
+      <td>7.0</td>
+      <td>0.121</td>
+      <td>0.086</td>
+      <td>30.0</td>
+      <td>37.0</td>
+      <td>1.06</td>
       <td>2</td>
     </tr>
     <tr>
       <th>N[s17]</th>
-      <td>8.351</td>
-      <td>1.993</td>
-      <td>6.0</td>
-      <td>11.0</td>
-      <td>1.279</td>
-      <td>1.043</td>
-      <td>3.0</td>
-      <td>4.0</td>
-      <td>2.07</td>
+      <td>5.967</td>
+      <td>0.647</td>
+      <td>5.0</td>
+      <td>7.0</td>
+      <td>0.116</td>
+      <td>0.084</td>
+      <td>32.0</td>
+      <td>38.0</td>
+      <td>1.05</td>
       <td>4</td>
     </tr>
     <tr>
       <th>N[s18]</th>
-      <td>9.964</td>
-      <td>2.402</td>
+      <td>7.832</td>
+      <td>0.764</td>
       <td>7.0</td>
-      <td>13.0</td>
-      <td>1.566</td>
-      <td>1.284</td>
-      <td>3.0</td>
-      <td>6.0</td>
-      <td>2.01</td>
+      <td>9.0</td>
+      <td>0.125</td>
+      <td>0.090</td>
+      <td>38.0</td>
+      <td>75.0</td>
+      <td>1.05</td>
       <td>5</td>
     </tr>
     <tr>
       <th>N[s19]</th>
-      <td>8.652</td>
-      <td>1.884</td>
+      <td>7.256</td>
+      <td>0.742</td>
       <td>6.0</td>
-      <td>11.0</td>
-      <td>1.226</td>
-      <td>1.004</td>
-      <td>3.0</td>
-      <td>10.0</td>
-      <td>2.06</td>
+      <td>8.0</td>
+      <td>0.183</td>
+      <td>0.132</td>
+      <td>16.0</td>
+      <td>64.0</td>
+      <td>1.09</td>
       <td>2</td>
     </tr>
   </tbody>
@@ -991,7 +1079,7 @@ az.summary(sim_trace, var_names=["N"]).assign(real_values=sim_data.Lambda)
 %watermark -d -u -v -iv -b -h -m
 ```
 
-    Last updated: 2022-10-08
+    Last updated: 2022-10-10
 
     Python implementation: CPython
     Python version       : 3.10.6
@@ -1007,16 +1095,16 @@ az.summary(sim_trace, var_names=["N"]).assign(real_values=sim_data.Lambda)
 
     Hostname: JHCookMac.local
 
-    Git branch: tumoroscope
+    Git branch: tumoroscope-tweaks
 
     pandas    : 1.5.0
-    scipy     : 1.9.1
-    janitor   : 0.22.0
+    arviz     : 0.12.1
     numpy     : 1.23.3
     pymc      : 4.2.1
-    arviz     : 0.12.1
+    scipy     : 1.9.1
     matplotlib: 3.6.0
     seaborn   : 0.12.0
+    janitor   : 0.22.0
 
 
 
