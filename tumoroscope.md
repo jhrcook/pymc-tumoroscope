@@ -6,6 +6,7 @@
 ```python
 import os
 from dataclasses import dataclass
+from math import ceil
 from pathlib import Path
 
 import aesara.tensor as at
@@ -52,14 +53,14 @@ class TumoroscopeData:
     S: int  # number of spots
     M: int  # number of mutation positions
     F: np.ndarray  # Prevelance of clones from bulk-DNA seq.
-    Lambda: np.ndarray  # Number of cell counted per spot
+    cell_counts: np.ndarray  # Number of cell counted per spot
     C: np.ndarray  # Zygosity per position and clone
     D_obs: np.ndarray | None  # Read count per position per spot
     A_obs: np.ndarray | None  # Alternated reads per position per spot
     zeta_s: float = 1.0  # Pi hyper-parameter
-    F_0: float = 0.01  # "pseudo-frequency" for lower bound on clone proportion
+    F_0: float = 1.0  # "pseudo-frequency" for lower bound on clone proportion
     l: float = 100  # Scaling factor to discretize F
-    r: float = 0.09  # shape parameter for Gamma over Phi
+    r: float = 0.1  # shape parameter for Gamma over Phi
     p: float = 1.0  # rate parameter for Gamma over Phi
 
 
@@ -70,12 +71,12 @@ def _prefixed_index(n: int, prefix: str) -> list[str]:
 def _check_tumoroscope_data(data: TumoroscopeData) -> None:
     assert data.K > 0 and data.S > 0 and data.M > 0
 
-    assert data.F.sum() == 1.0
+    assert np.isclose(data.F.sum(), 1.0)
     assert data.F.ndim == 1
     assert data.F.shape[0] == data.K
 
-    assert data.Lambda.shape == (data.S,)
-    assert np.all(data.Lambda > 0)
+    assert data.cell_counts.shape == (data.S,)
+    assert np.all(data.cell_counts > 0)
 
     assert np.all(data.C >= 0.0) and np.all(data.C <= 1.0)
     assert data.C.shape == (data.M, data.K)
@@ -101,16 +102,16 @@ def _make_tumoroscope_model_coords(data: TumoroscopeData) -> dict[str, list[str]
     return coords
 
 
-def tumoroscope(data: TumoroscopeData) -> pm.Model:
+def tumoroscope(data: TumoroscopeData, fixed: bool = False) -> pm.Model:
     _check_tumoroscope_data(data)
     coords = _make_tumoroscope_model_coords(data)
-    _Z_init = np.ones((data.S, data.K), dtype=int)
     with pm.Model(coords=coords) as model:
         ζ_s = pm.ConstantData("ζ_s", data.zeta_s)
         ℓ = pm.ConstantData("ℓ", data.l)
         F_0 = pm.ConstantData("F0", data.F_0)
         F = pm.ConstantData("F", data.F, dims="clone")
-        Λ = pm.ConstantData("Λ", data.Lambda, dims="spot")
+        if not fixed:
+            Λ = pm.ConstantData("Λ", data.cell_counts, dims="spot")
         r = pm.ConstantData("r", data.r)
         p = pm.ConstantData("p", data.p)
         C = pm.ConstantData("C", data.C, dims=("position", "clone"))
@@ -118,23 +119,27 @@ def tumoroscope(data: TumoroscopeData) -> pm.Model:
         F_prime = pm.Deterministic("F_prime", ℓ * at.ceil(20 * F) / 20, dims="clone")
 
         Π = pm.Beta("Π", alpha=ζ_s / data.K, beta=1, dims=("spot", "clone"))
-        Z = pm.Bernoulli("Z", p=Π, dims=("spot", "clone"))  # , initval=_Z_init)
-        G = pm.Gamma("G", (F_prime**Z) * (F_0 ** (1 - Z)), 1, dims=("spot", "clone"))
+        Z = pm.Bernoulli("Z", p=Π, dims=("spot", "clone"))
+        G = pm.Gamma(
+            "G", (F_prime[None, :] ** Z) * (F_0 ** (1 - Z)), 1, dims=("spot", "clone")
+        )
         H = pm.Deterministic("H", G / G.sum(axis=1)[:, None], dims=("spot", "clone"))
 
-        N = pm.Poisson("N", Λ, dims="spot")
+        if fixed:
+            N = pm.ConstantData("N", data.cell_counts, dims="spot")
+        else:
+            N = pm.Poisson("N", Λ, dims="spot")
         Φ = pm.Gamma("Φ", r, p, dims=("position", "clone"))
+
         D = pm.Poisson(
             "D", N * H.dot(Φ.T).T, dims=("position", "spot"), observed=data.D_obs
         )
-
-        _A_num = pm.Deterministic(
-            "A_num", H.dot((Φ * C).T).T, dims=("position", "spot")
+        _A_num = H.dot((Φ * C).T).T
+        _A_denom = H.dot(Φ.T).T
+        A_prob = pm.Deterministic(
+            "A_prob", _A_num / _A_denom, dims=("position", "spot")
         )
-        _A_denom = pm.Deterministic("A_denom", H.dot(Φ.T).T, dims=("position", "spot"))
-        A = pm.Binomial(
-            "A", D, _A_num / _A_denom, dims=("position", "spot"), observed=data.A_obs
-        )
+        A = pm.Binomial("A", D, A_prob, dims=("position", "spot"), observed=data.A_obs)
     return model
 ```
 
@@ -146,14 +151,12 @@ mock_tumor_data = TumoroscopeData(
     S=10,
     M=40,
     F=np.ones(5) / 5.0,
-    Lambda=np.random.randint(1, 20, size=10),
+    cell_counts=np.random.randint(1, 20, size=10),
     C=np.random.beta(2, 2, size=(40, 5)),
     D_obs=np.random.randint(2, 20, size=(40, 10)),
     A_obs=np.random.randint(2, 20, size=(40, 10)),
 )
-
-m = tumoroscope(mock_tumor_data)
-pm.model_to_graphviz(m)
+pm.model_to_graphviz(tumoroscope(mock_tumor_data))
 ```
 
 
@@ -161,6 +164,20 @@ pm.model_to_graphviz(m)
 
 
 ![svg](tumoroscope_files/tumoroscope_9_0.svg)
+
+
+
+
+
+```python
+pm.model_to_graphviz(tumoroscope(mock_tumor_data, fixed=True))
+```
+
+
+
+
+
+![svg](tumoroscope_files/tumoroscope_10_0.svg)
 
 
 
@@ -181,8 +198,8 @@ example_input_data = TumoroscopeData(
     S=10,
     M=40,
     F=np.array([0.01, 0.05, 0.15, 0.3, 0.49]),
-    Lambda=np.ones(10) * 5,
-    C=np.ones((40, 5), float),
+    cell_counts=np.ones(10) * 5,
+    C=np.random.choice([0, 0.5, 1.0], size=(40, 5), replace=True),
     D_obs=None,
     A_obs=None,
     r=0.19,
@@ -192,7 +209,7 @@ example_input_data = TumoroscopeData(
 with tumoroscope(example_input_data) as m:
     prior_pred = pm.sample_prior_predictive(
         500,
-        var_names=["D", "A", "H", "G", "Z", "Π", "Φ", "N", "A_num", "A_denom"],
+        var_names=["D", "A", "H", "G", "Z", "Π", "Φ", "N", "A_prob"],
         random_seed=123,
     )
 ```
@@ -223,7 +240,7 @@ plt.show()
 
 
 
-![png](tumoroscope_files/tumoroscope_14_0.png)
+![png](tumoroscope_files/tumoroscope_15_0.png)
 
 
 
@@ -241,7 +258,7 @@ plt.show()
 
 
 
-![png](tumoroscope_files/tumoroscope_15_0.png)
+![png](tumoroscope_files/tumoroscope_16_0.png)
 
 
 
@@ -265,7 +282,25 @@ plt.show()
 
 
 
-![png](tumoroscope_files/tumoroscope_16_0.png)
+![png](tumoroscope_files/tumoroscope_17_0.png)
+
+
+
+
+```python
+plt.imshow(prior_pred.prior["A_prob"].mean(dim=("chain", "draw")))
+```
+
+
+
+
+    <matplotlib.image.AxesImage at 0x15418c9d0>
+
+
+
+
+
+![png](tumoroscope_files/tumoroscope_18_1.png)
 
 
 
@@ -279,8 +314,8 @@ prior_pred.prior["D"].mean(axis=(0, 1)).sum(axis=0).values
 
 
 
-    array([37.496, 38.722, 36.512, 38.574, 38.528, 38.484, 37.55 , 37.6  ,
-           37.568, 39.028])
+    array([37.208, 38.7  , 37.204, 38.064, 38.834, 39.186, 38.212, 37.386,
+           37.636, 39.206])
 
 
 
@@ -295,26 +330,18 @@ plt.show()
 
 
 
-![png](tumoroscope_files/tumoroscope_19_0.png)
+![png](tumoroscope_files/tumoroscope_21_0.png)
 
 
 
 ## Simulation experiments
 
+### Simple simulation
 
-```python
-_, ax = plt.subplots(figsize=(4, 2))
-x = np.linspace(0, 1, 500)
-y = scipy.stats.beta(2, 1).pdf(x)
-ax.plot(x, y)
-plt.show()
-```
-
-
-
-![png](tumoroscope_files/tumoroscope_21_0.png)
-
-
+This simulation is purposefully simple to give the model the best chance at working if it correctly specified.
+There are only two clones, one with mutations and one with none.
+There are many cells per spot to increase the odds of mixtures of clones.
+The number of reads per position per clone is fixed at 3 per cell and the number of alternative reads is perfectly aligned with the zygosity of the mutation in the clone.
 
 
 ```python
@@ -324,14 +351,16 @@ np.random.seed(8383)
 # Set true underlying constants.
 N_CLONES = 2
 N_SPOTS = 20
-n_positions = 300  # changes below
+n_positions = 300  # changes below depending on random sampling
 
 # Number of cells counted in each spot between 2 and 8 cells.
-cell_counts = np.random.randint(2, 8, size=N_SPOTS)
+cell_counts = np.random.randint(10, 20, size=N_SPOTS)
 
 # True mutations for each clone.
 clone_mutations = np.hstack(
-    [np.random.binomial(1, p, size=(n_positions, 1)) for p in [0.5, 0.5]]
+    [
+        np.random.binomial(1, p, size=(n_positions, 1)) for p in [0.0, 0.5]
+    ]  # , 0.5, 0.3, 0.3]]
 )
 # Drop positions without any mutations.
 clone_mutations = clone_mutations[clone_mutations.sum(axis=1) > 0.0, :]
@@ -340,15 +369,18 @@ n_positions = clone_mutations.shape[0]
 print(f"Number of positions: {n_positions}")
 
 # Assign probability distribution over spots for each clone.
-clone_props_params = [(3, 1), (1, 3)]
+clone_props_params = [(1, 3), (3, 1)]
+clone_ratios = np.array([0.5, 0.5])
 spots_x = np.linspace(0, 1, N_SPOTS)
 clone_proportions = np.hstack(
     [scipy.stats.beta(a, b).pdf(spots_x)[:, None] for a, b in clone_props_params]
 )
+clone_proportions = clone_proportions * clone_ratios
 clone_proportions = clone_proportions / clone_proportions.sum(axis=1)[:, None]
 
 # True fraction of clones taken from the underlying distributions.
-F = np.array([a / (a + b) for a, b in clone_props_params])
+F = np.array([scipy.stats.beta(a, b).pdf(spots_x).sum() for a, b in clone_props_params])
+F = F * clone_ratios
 F = F / F.sum()
 
 _cell_labels: list[tuple[int, int, int]] = []
@@ -361,7 +393,7 @@ cell_labels = pd.DataFrame(_cell_labels, columns=["spot", "cell", "clone"])
 cell_labels.head()
 ```
 
-    Number of positions: 131
+    Number of positions: 150
 
 
 
@@ -395,31 +427,31 @@ cell_labels.head()
       <th>0</th>
       <td>0</td>
       <td>0</td>
-      <td>1</td>
+      <td>0</td>
     </tr>
     <tr>
       <th>1</th>
       <td>0</td>
       <td>1</td>
-      <td>1</td>
+      <td>0</td>
     </tr>
     <tr>
       <th>2</th>
       <td>0</td>
       <td>2</td>
-      <td>1</td>
+      <td>0</td>
     </tr>
     <tr>
       <th>3</th>
       <td>0</td>
       <td>3</td>
-      <td>1</td>
+      <td>0</td>
     </tr>
     <tr>
       <th>4</th>
-      <td>1</td>
       <td>0</td>
-      <td>1</td>
+      <td>4</td>
+      <td>0</td>
     </tr>
   </tbody>
 </table>
@@ -445,7 +477,7 @@ plt.show()
 
 
 
-![png](tumoroscope_files/tumoroscope_23_0.png)
+![png](tumoroscope_files/tumoroscope_25_0.png)
 
 
 
@@ -481,7 +513,7 @@ plt.show()
 
 
 
-![png](tumoroscope_files/tumoroscope_24_0.png)
+![png](tumoroscope_files/tumoroscope_26_0.png)
 
 
 
@@ -495,7 +527,7 @@ F, clone_proportions.mean(axis=0)
 
 
 
-    (array([0.75, 0.25]), array([0.5, 0.5]))
+    (array([0.5, 0.5]), array([0.5, 0.5]))
 
 
 
@@ -510,7 +542,7 @@ plt.show()
 
 
 
-![png](tumoroscope_files/tumoroscope_27_0.png)
+![png](tumoroscope_files/tumoroscope_29_0.png)
 
 
 
@@ -527,69 +559,77 @@ cg.ax_col_dendrogram.set_title("Mutations in clones")
 plt.show()
 ```
 
-
-
-![png](tumoroscope_files/tumoroscope_28_0.png)
-
-
-
-
-```python
-clone_mutations.shape
-```
+    /usr/local/Caskroom/miniconda/base/envs/pymc-tumoroscope/lib/python3.10/site-packages/seaborn/matrix.py:720: UserWarning: Attempting to set identical low and high ylims makes transformation singular; automatically expanding.
+      ax.set_ylim(0, max_dependent_coord * 1.05)
 
 
 
 
-    (131, 2)
+![png](tumoroscope_files/tumoroscope_30_1.png)
 
 
 
 
 ```python
-# Randomly assign read coverage per position per spot with min of 2 reads.
-# read_coverage = np.random.poisson(10, size=(n_positions, N_SPOTS)) + 2
+np.random.seed(44)
 
 # Randomly assign zygosity per position for each clone.
-# zygosity = np.random.beta(10, 1, size=(n_positions, N_CLONES))
-zygosity = clone_mutations.copy()
-print(f"average zygosity: {zygosity.mean():0.2f}")
+zygosity = np.random.choice([0.5, 1.0], size=(n_positions, N_CLONES)) * clone_mutations
 
-# For each cell in each spot, sample some number of reads for each position.
-# Builds the matrix A for number of alternate reads per position and spot.
-# alt_read_counts = (clone_mutations * zygosity).dot(clone_proportions.T) * read_coverage
+# For each cell in each spot, there are 4 reads.
+# The number of alternative reads is perfectly calculated based on the
+#   zygosity of the clone at the position.
+
 alt_read_counts = np.zeros((n_positions, N_SPOTS, N_CLONES))
 tot_read_counts = np.zeros((n_positions, N_SPOTS, N_CLONES))
-for _, row in cell_labels.iterrows():
-    alt_reads = (
-        np.random.poisson(3, size=n_positions) * clone_mutations[:, row["clone"]]
-    )
-    alt_read_counts[:, row["spot"], row["clone"]] = alt_reads
-    tot_reads = alt_reads + (1 - zygosity[:, row["clone"]]) * alt_reads
+
+clone_cell_counts_per_spot = (
+    cell_labels.groupby(["spot", "clone"])["cell"]
+    .count()
+    .reset_index()
+    .rename(columns={"cell": "n_cells"})
+)
+
+for _, row in clone_cell_counts_per_spot.iterrows():
+    # tot_reads = np.random.poisson(10, size=n_positions)
+    # alt_reads = np.random.binomial(tot_reads, zygosity[:, row["clone"]])
+    tot_reads = (np.ones(n_positions) * 4 * row["n_cells"]).astype(int)
+    alt_reads = np.round(zygosity[:, row["clone"]] * tot_reads).astype(int)
     tot_read_counts[:, row["spot"], row["clone"]] = tot_reads
+    alt_read_counts[:, row["spot"], row["clone"]] = alt_reads
 
 alt_read_counts = alt_read_counts.sum(axis=2)
 tot_read_counts = tot_read_counts.sum(axis=2)
 alt_read_counts.shape
 ```
 
-    average zygosity: 0.50
 
 
 
-
-
-    (131, 20)
+    (150, 20)
 
 
 
 
 ```python
+avg_read_cts = tot_read_counts.sum(axis=0).mean()
+print(f"average reads per spot: {avg_read_cts:0.2f}")
+```
+
+    average reads per spot: 8640.00
+
+
+For this simulation, the total counts is $4 \times n_\text{cells}$ in each position per spot.
+The alternative reads is this number multiplied by the zygosity of the clone and fraction of the clone in the spot.
+Clone 0 has no mutations so the alternative read count fades with the number of clone 1 cells.
+
+
+```python
 fig, axes = plt.subplots(ncols=2, figsize=(12, 5))
 sns.heatmap(tot_read_counts, cmap="Greys", ax=axes[0])
-ax.set_title("Total read counts")
+axes[0].set_title("Total read counts")
 sns.heatmap(alt_read_counts, cmap="Greys", ax=axes[1])
-ax.set_title("Alternative read counts")
+axes[1].set_title("Alternative read counts")
 
 for ax in axes:
     ax.tick_params(size=0)
@@ -601,22 +641,7 @@ plt.show()
 
 
 
-![png](tumoroscope_files/tumoroscope_31_0.png)
-
-
-
-Number of reads per spot.
-
-
-```python
-tot_read_counts.sum(axis=0).round(2)
-```
-
-
-
-
-    array([177., 170., 174., 164., 183., 392., 203., 172., 397., 385., 195.,
-           403., 394., 416., 223., 389., 196., 178., 236., 226.])
+![png](tumoroscope_files/tumoroscope_34_0.png)
 
 
 
@@ -626,69 +651,37 @@ sim_data = TumoroscopeData(
     K=N_CLONES,
     S=N_SPOTS,
     M=n_positions,
+    F_0=1,
     F=F,
-    Lambda=cell_counts,
+    cell_counts=cell_counts,
     C=zygosity,
     D_obs=tot_read_counts,
     A_obs=alt_read_counts,
     zeta_s=N_CLONES * 2,
+    r=1,
+    p=1,
 )
 
 sim_trace_fp = models_dir / "simulation-trace.netcdf"
-
-if True and sim_trace_fp.exists():
+if False and sim_trace_fp.exists():
     print("Removing trace cache.")
     os.remove(sim_trace_fp)
 
 if sim_trace_fp.exists():
+    print("Retrieving cached posterior.")
     sim_trace = az.from_netcdf(sim_trace_fp)
 else:
-    with tumoroscope(sim_data):
+    with tumoroscope(sim_data, fixed=False):
         sim_trace = pm.sample(
-            draws=500, tune=1000, chains=2, cores=2, random_seed=10, target_accept=0.95
+            draws=500, tune=1000, chains=4, cores=4, random_seed=10, target_accept=0.9
+        )
+        pm.sample_posterior_predictive(
+            sim_trace, random_seed=7348, extend_inferencedata=True
         )
     sim_trace.to_netcdf(sim_trace_fp)
 ```
 
-    Multiprocess sampling (2 chains in 2 jobs)
-    CompoundStep
-    >NUTS: [Π, G, Φ]
-    >BinaryGibbsMetropolis: [Z]
-    >Metropolis: [N]
-
-
-
-
-<style>
-    /* Turns off some styling */
-    progress {
-        /* gets rid of default border in Firefox and Opera. */
-        border: none;
-        /* Needs to be in here for Safari polyfill so background images work as expected. */
-        background-size: auto;
-    }
-    progress:not([value]), progress:not([value])::-webkit-progress-bar {
-        background: repeating-linear-gradient(45deg, #7e7e7e, #7e7e7e 10px, #5c5c5c 10px, #5c5c5c 20px);
-    }
-    .progress-bar-interrupted, .progress-bar-interrupted::-webkit-progress-bar {
-        background: #F44336;
-    }
-</style>
-
-
-
-
-
-<div>
-  <progress value='3000' class='' max='3000' style='width:300px; height:20px; vertical-align: middle;'></progress>
-  100.00% [3000/3000 08:51&lt;00:00 Sampling 2 chains, 25 divergences]
-</div>
-
-
-
-    Sampling 2 chains for 1_000 tune and 500 draw iterations (2_000 + 1_000 draws total) took 551 seconds.
-    There were 13 divergences after tuning. Increase `target_accept` or reparameterize.
-    There were 12 divergences after tuning. Increase `target_accept` or reparameterize.
+    Retrieving cached posterior.
 
 
 
@@ -697,7 +690,7 @@ n_divs = sim_trace.sample_stats.diverging.sum(axis=1).values
 print(f"Number of divergences per chain: {n_divs}")
 ```
 
-    Number of divergences per chain: [13 12]
+    Number of divergences per chain: [0 0 0 0]
 
 
 
@@ -706,10 +699,10 @@ def _frac_clone(s: pd.Series, k: int) -> float:
     return np.mean(s == k)
 
 
-fig, axes = plt.subplots(nrows=sim_data.K, figsize=(5, 2.5 * sim_data.K))
+fig, axes = plt.subplots(nrows=sim_data.K, figsize=(5, 2.5 * sim_data.K), sharex=True)
 for clone_i, ax in enumerate(axes.flatten()):
     clone = f"c{clone_i}"
-    ax.set_title(clone)
+    ax.set_title(f"clone {clone}")
 
     # Plot true fraction of clones at each spot.
     true_clone_frac = cell_labels.groupby(["spot"])["clone"].apply(
@@ -737,21 +730,11 @@ for clone_i, ax in enumerate(axes.flatten()):
         ax.vlines(
             x=_x, ymin=_hdi[:, 0], ymax=_hdi[:, 1], lw=0.5, zorder=10, color="tab:red"
         )
+    ax.set_xlabel("spot")
+    ax.set_ylabel("proportion of cells")
 
 fig.tight_layout()
 plt.show()
-```
-
-
-
-![png](tumoroscope_files/tumoroscope_36_0.png)
-
-
-
-
-```python
-az.plot_trace(sim_trace, var_names=["H", "G", "N"])
-plt.tight_layout()
 ```
 
 
@@ -762,310 +745,123 @@ plt.tight_layout()
 
 
 ```python
-az.summary(sim_trace, var_names=["N"]).assign(real_values=sim_data.Lambda)
+az.plot_trace(sim_trace, var_names=["G", "H"])
+plt.tight_layout()
 ```
 
-    /usr/local/Caskroom/miniconda/base/envs/pymc-tumoroscope/lib/python3.10/site-packages/arviz/stats/diagnostics.py:586: RuntimeWarning: invalid value encountered in double_scalars
-      (between_chain_variance / within_chain_variance + num_samples - 1) / (num_samples)
+
+
+![png](tumoroscope_files/tumoroscope_38_0.png)
+
+
+
+
+```python
+cell_counts_post = az.summary(sim_trace, var_names=["N"]).assign(
+    truth=sim_data.cell_counts
+)
+
+_, ax = plt.subplots(figsize=(6, 3))
+np.arange(len(cell_counts_post))
+ax.scatter(x, cell_counts_post["mean"], c="tab:blue", zorder=10, s=10)
+ax.plot(x, cell_counts_post["mean"], c="tab:blue", zorder=2, lw=0.5, alpha=0.5)
+ax.vlines(
+    x,
+    cell_counts_post["hdi_5.5%"],
+    cell_counts_post["hdi_94.5%"],
+    color="tab:blue",
+    zorder=10,
+    lw=1,
+)
+ax.set_xlabel("spot")
+ax.set_ylabel("num. cells")
+ax.scatter(x, cell_counts_post["truth"], c="k", zorder=5, s=10)
+ax.plot(x, cell_counts_post["truth"], c="k", zorder=2, lw=0.5, alpha=0.5)
+```
+
+
+
+
+    [<matplotlib.lines.Line2D at 0x156247610>]
 
 
 
 
 
-<div>
-<style scoped>
-    .dataframe tbody tr th:only-of-type {
-        vertical-align: middle;
-    }
+![png](tumoroscope_files/tumoroscope_39_1.png)
 
-    .dataframe tbody tr th {
-        vertical-align: top;
-    }
 
-    .dataframe thead th {
-        text-align: right;
-    }
-</style>
-<table border="1" class="dataframe">
-  <thead>
-    <tr style="text-align: right;">
-      <th></th>
-      <th>mean</th>
-      <th>sd</th>
-      <th>hdi_5.5%</th>
-      <th>hdi_94.5%</th>
-      <th>mcse_mean</th>
-      <th>mcse_sd</th>
-      <th>ess_bulk</th>
-      <th>ess_tail</th>
-      <th>r_hat</th>
-      <th>real_values</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <th>N[s0]</th>
-      <td>3.012</td>
-      <td>0.109</td>
-      <td>3.0</td>
-      <td>3.0</td>
-      <td>0.009</td>
-      <td>0.006</td>
-      <td>142.0</td>
-      <td>142.0</td>
-      <td>1.01</td>
-      <td>4</td>
-    </tr>
-    <tr>
-      <th>N[s1]</th>
-      <td>3.004</td>
-      <td>0.063</td>
-      <td>3.0</td>
-      <td>3.0</td>
-      <td>0.002</td>
-      <td>0.002</td>
-      <td>672.0</td>
-      <td>672.0</td>
-      <td>1.00</td>
-      <td>5</td>
-    </tr>
-    <tr>
-      <th>N[s2]</th>
-      <td>3.009</td>
-      <td>0.105</td>
-      <td>3.0</td>
-      <td>3.0</td>
-      <td>0.007</td>
-      <td>0.005</td>
-      <td>212.0</td>
-      <td>189.0</td>
-      <td>1.01</td>
-      <td>3</td>
-    </tr>
-    <tr>
-      <th>N[s3]</th>
-      <td>3.000</td>
-      <td>0.000</td>
-      <td>3.0</td>
-      <td>3.0</td>
-      <td>0.000</td>
-      <td>0.000</td>
-      <td>1000.0</td>
-      <td>1000.0</td>
-      <td>NaN</td>
-      <td>6</td>
-    </tr>
-    <tr>
-      <th>N[s4]</th>
-      <td>3.036</td>
-      <td>0.186</td>
-      <td>3.0</td>
-      <td>3.0</td>
-      <td>0.012</td>
-      <td>0.009</td>
-      <td>225.0</td>
-      <td>225.0</td>
-      <td>1.01</td>
-      <td>5</td>
-    </tr>
-    <tr>
-      <th>N[s5]</th>
-      <td>9.902</td>
-      <td>0.767</td>
-      <td>9.0</td>
-      <td>11.0</td>
-      <td>0.144</td>
-      <td>0.105</td>
-      <td>29.0</td>
-      <td>79.0</td>
-      <td>1.07</td>
-      <td>5</td>
-    </tr>
-    <tr>
-      <th>N[s6]</th>
-      <td>3.619</td>
-      <td>0.490</td>
-      <td>3.0</td>
-      <td>4.0</td>
-      <td>0.060</td>
-      <td>0.042</td>
-      <td>69.0</td>
-      <td>66.0</td>
-      <td>1.02</td>
-      <td>6</td>
-    </tr>
-    <tr>
-      <th>N[s7]</th>
-      <td>3.002</td>
-      <td>0.045</td>
-      <td>3.0</td>
-      <td>3.0</td>
-      <td>0.001</td>
-      <td>0.001</td>
-      <td>1011.0</td>
-      <td>1011.0</td>
-      <td>1.00</td>
-      <td>4</td>
-    </tr>
-    <tr>
-      <th>N[s8]</th>
-      <td>10.003</td>
-      <td>0.861</td>
-      <td>9.0</td>
-      <td>11.0</td>
-      <td>0.252</td>
-      <td>0.183</td>
-      <td>12.0</td>
-      <td>23.0</td>
-      <td>1.13</td>
-      <td>2</td>
-    </tr>
-    <tr>
-      <th>N[s9]</th>
-      <td>10.068</td>
-      <td>0.756</td>
-      <td>9.0</td>
-      <td>11.0</td>
-      <td>0.197</td>
-      <td>0.142</td>
-      <td>15.0</td>
-      <td>41.0</td>
-      <td>1.10</td>
-      <td>5</td>
-    </tr>
-    <tr>
-      <th>N[s10]</th>
-      <td>6.471</td>
-      <td>0.655</td>
-      <td>6.0</td>
-      <td>7.0</td>
-      <td>0.132</td>
-      <td>0.096</td>
-      <td>26.0</td>
-      <td>34.0</td>
-      <td>1.07</td>
-      <td>3</td>
-    </tr>
-    <tr>
-      <th>N[s11]</th>
-      <td>10.346</td>
-      <td>0.823</td>
-      <td>9.0</td>
-      <td>11.0</td>
-      <td>0.154</td>
-      <td>0.111</td>
-      <td>30.0</td>
-      <td>74.0</td>
-      <td>1.06</td>
-      <td>5</td>
-    </tr>
-    <tr>
-      <th>N[s12]</th>
-      <td>10.314</td>
-      <td>0.837</td>
-      <td>9.0</td>
-      <td>11.0</td>
-      <td>0.228</td>
-      <td>0.165</td>
-      <td>13.0</td>
-      <td>42.0</td>
-      <td>1.12</td>
-      <td>7</td>
-    </tr>
-    <tr>
-      <th>N[s13]</th>
-      <td>10.451</td>
-      <td>0.806</td>
-      <td>9.0</td>
-      <td>11.0</td>
-      <td>0.142</td>
-      <td>0.103</td>
-      <td>35.0</td>
-      <td>125.0</td>
-      <td>1.05</td>
-      <td>5</td>
-    </tr>
-    <tr>
-      <th>N[s14]</th>
-      <td>7.207</td>
-      <td>0.698</td>
-      <td>6.0</td>
-      <td>8.0</td>
-      <td>0.107</td>
-      <td>0.077</td>
-      <td>43.0</td>
-      <td>97.0</td>
-      <td>1.06</td>
-      <td>2</td>
-    </tr>
-    <tr>
-      <th>N[s15]</th>
-      <td>9.958</td>
-      <td>0.723</td>
-      <td>9.0</td>
-      <td>11.0</td>
-      <td>0.157</td>
-      <td>0.112</td>
-      <td>21.0</td>
-      <td>38.0</td>
-      <td>1.09</td>
-      <td>5</td>
-    </tr>
-    <tr>
-      <th>N[s16]</th>
-      <td>6.389</td>
-      <td>0.651</td>
-      <td>6.0</td>
-      <td>7.0</td>
-      <td>0.121</td>
-      <td>0.086</td>
-      <td>30.0</td>
-      <td>37.0</td>
-      <td>1.06</td>
-      <td>2</td>
-    </tr>
-    <tr>
-      <th>N[s17]</th>
-      <td>5.967</td>
-      <td>0.647</td>
-      <td>5.0</td>
-      <td>7.0</td>
-      <td>0.116</td>
-      <td>0.084</td>
-      <td>32.0</td>
-      <td>38.0</td>
-      <td>1.05</td>
-      <td>4</td>
-    </tr>
-    <tr>
-      <th>N[s18]</th>
-      <td>7.832</td>
-      <td>0.764</td>
-      <td>7.0</td>
-      <td>9.0</td>
-      <td>0.125</td>
-      <td>0.090</td>
-      <td>38.0</td>
-      <td>75.0</td>
-      <td>1.05</td>
-      <td>5</td>
-    </tr>
-    <tr>
-      <th>N[s19]</th>
-      <td>7.256</td>
-      <td>0.742</td>
-      <td>6.0</td>
-      <td>8.0</td>
-      <td>0.183</td>
-      <td>0.132</td>
-      <td>16.0</td>
-      <td>64.0</td>
-      <td>1.09</td>
-      <td>2</td>
-    </tr>
-  </tbody>
-</table>
-</div>
+
+
+```python
+clone_counts = (
+    cell_labels.astype({"clone": "category"}).groupby(["spot", "clone"]).count()
+)
+Z_post_summary = (
+    az.summary(sim_trace, var_names=["Z"], kind="stats")
+    .assign(mean=lambda d: d["mean"] > 0.5)
+    .assign(truth=clone_counts["cell"].values > 0)
+)
+Z_accuracy = np.mean(Z_post_summary["mean"] == Z_post_summary["truth"])
+print(f"accuracy of Z: {Z_accuracy:0.2f}")
+```
+
+    accuracy of Z: 0.82
+
+
+
+```python
+Z_dist = (
+    sim_trace.posterior["Z"]
+    .to_dataframe()
+    .reset_index()
+    .groupby(["spot", "clone", "Z"])["draw"]
+    .count()
+    .reset_index()
+)
+Z_dist["spot"] = pd.Categorical(Z_dist["spot"], sim_trace.posterior.coords["spot"])
+
+fig, axes = plt.subplots(
+    nrows=2, ncols=ceil(sim_data.K / 2), figsize=(7, 4), sharex=True
+)
+for ax, (clone, Z_dist_k) in zip(axes.flatten(), Z_dist.groupby("clone")):
+    ax.set_title(f"clone {clone}")
+    sns.barplot(data=Z_dist_k, x="spot", y="draw", hue="Z", ax=ax)
+    ax.legend(loc="upper left", bbox_to_anchor=(1, 1), title="Z", handlelength=1)
+    ax.set_xlabel("spot")
+    ax.set_ylabel("number of draws")
+
+fig.tight_layout()
+plt.show()
+```
+
+
+
+![png](tumoroscope_files/tumoroscope_41_0.png)
+
+
+
+
+```python
+fig, axes = plt.subplots(ncols=2, figsize=(6, 5), sharey=True)
+A_prob = sim_trace.posterior_predictive["A"].mean(dim=("chain", "draw")).values
+# axes[0].imshow(A_prob)
+sns.heatmap(
+    sim_data.A_obs, ax=axes[0], cbar_kws={"shrink": 0.7, "label": "num. alt. reads"}
+)
+sns.heatmap(A_prob, ax=axes[1], cbar_kws={"shrink": 0.7, "label": "num. alt. reads"})
+axes[0].set_xlabel("spot")
+axes[1].set_xlabel("spot")
+axes[0].set_ylabel("position")
+
+axes[0].set_title("alt. reads - true")
+axes[1].set_title("alt. reads - est.")
+fig.tight_layout()
+```
+
+
+
+![png](tumoroscope_files/tumoroscope_42_0.png)
 
 
 
@@ -1079,7 +875,7 @@ az.summary(sim_trace, var_names=["N"]).assign(real_values=sim_data.Lambda)
 %watermark -d -u -v -iv -b -h -m
 ```
 
-    Last updated: 2022-10-10
+    Last updated: 2022-10-11
 
     Python implementation: CPython
     Python version       : 3.10.6
@@ -1097,14 +893,15 @@ az.summary(sim_trace, var_names=["N"]).assign(real_values=sim_data.Lambda)
 
     Git branch: tumoroscope-tweaks
 
-    pandas    : 1.5.0
-    arviz     : 0.12.1
-    numpy     : 1.23.3
     pymc      : 4.2.1
-    scipy     : 1.9.1
-    matplotlib: 3.6.0
     seaborn   : 0.12.0
+    pandas    : 1.5.0
+    numpy     : 1.23.3
+    matplotlib: 3.6.0
+    arviz     : 0.12.1
     janitor   : 0.22.0
+    aesara    : 2.8.6
+    scipy     : 1.9.1
 
 
 

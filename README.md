@@ -4,9 +4,13 @@ In this repo, I try to reproduce the Tumoroscope model presented by Shafighi *et
 
 ![Tumorosope-overview](tumoroscope-overview.png)
 
-[bioR$\chi$iv preprint](https://www.biorxiv.org/content/10.1101/2022.09.22.508914)
+## Notebook
 
-Citation for the preprint:
+**[Notebook of Tumoroscope in PyMC](tumoroscope.ipynb)** ([markdown](tumoroscope.md))
+
+## Citation
+
+Link to the [preprint](https://www.biorxiv.org/content/10.1101/2022.09.22.508914) on bioR$\chi$iv.
 
 ```
 @article {Shafighi2022.09.22.508914,
@@ -21,5 +25,4 @@ Citation for the preprint:
 	eprint = {https://www.biorxiv.org/content/early/2022/09/23/2022.09.22.508914.full.pdf},
 	journal = {bioRxiv}
 }
-
 ```
