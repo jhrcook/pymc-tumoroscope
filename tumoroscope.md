@@ -294,7 +294,7 @@ plt.imshow(prior_pred.prior["A_prob"].mean(dim=("chain", "draw")))
 
 
 
-    <matplotlib.image.AxesImage at 0x15418c9d0>
+    <matplotlib.image.AxesImage at 0x14e9d15d0>
 
 
 
@@ -353,14 +353,12 @@ N_CLONES = 2
 N_SPOTS = 20
 n_positions = 300  # changes below depending on random sampling
 
-# Number of cells counted in each spot between 2 and 8 cells.
+# Number of cells counted in each spot between 10 and 20 cells.
 cell_counts = np.random.randint(10, 20, size=N_SPOTS)
 
 # True mutations for each clone.
 clone_mutations = np.hstack(
-    [
-        np.random.binomial(1, p, size=(n_positions, 1)) for p in [0.0, 0.5]
-    ]  # , 0.5, 0.3, 0.3]]
+    [np.random.binomial(1, p, size=(n_positions, 1)) for p in [0.0, 0.5]]
 )
 # Drop positions without any mutations.
 clone_mutations = clone_mutations[clone_mutations.sum(axis=1) > 0.0, :]
@@ -782,7 +780,7 @@ ax.plot(x, cell_counts_post["truth"], c="k", zorder=2, lw=0.5, alpha=0.5)
 
 
 
-    [<matplotlib.lines.Line2D at 0x156247610>]
+    [<matplotlib.lines.Line2D at 0x14ed5fa00>]
 
 
 
@@ -865,6 +863,275 @@ fig.tight_layout()
 
 
 
+### Realistic simulation
+
+This simulations is more complex and attempts to be more realistic.
+This means increasing the number of clones, mutations/positions, and spots, while reducing the number of cells per spot and read coverage.
+For simplicity, I'm not going to add noise to the number of cells, but I will add randomness to the read coverage and alternate read counts.
+The underlying simulation parameters were adjusted per the description in the preprint manuscript.
+
+
+```python
+# Set seed for reproducible results.
+np.random.seed(8383)
+
+# Set true underlying constants.
+N_CLONES = 5
+N_SPOTS = 30
+n_positions = 60  # number changes below depending on random sampling
+
+# True mutations for each clone.
+clone_mutations = np.random.binomial(1, 0.136, size=(n_positions, N_CLONES))
+# Drop positions without any mutations.
+clone_mutations = clone_mutations[clone_mutations.sum(axis=1) > 0.0, :]
+clone_mutations = clone_mutations[clone_mutations.mean(axis=1) < 1.0, :]
+n_positions = clone_mutations.shape[0]
+print(f"Number of positions: {n_positions}")
+
+# Number of cells counted in each spot between 1 and 4 cells.
+cell_counts = np.random.randint(1, 5, size=N_SPOTS)
+_cell_labels = []
+for spot_s in range(N_SPOTS):
+    for cell_i in range(cell_counts[spot_s]):
+        _cell_labels.append((spot_s, cell_i, np.random.randint(N_CLONES)))
+
+cell_labels = pd.DataFrame(_cell_labels, columns=["spot", "cell", "clone"])
+cell_labels.head()
+clone_proportions = cell_labels.groupby("clone")["cell"].count().values
+clone_proportions = clone_proportions / clone_proportions.sum()
+clone_proportions
+```
+
+    Number of positions: 32
+
+
+
+
+
+    array([0.17910448, 0.13432836, 0.29850746, 0.14925373, 0.23880597])
+
+
+
+
+```python
+np.random.seed(3)
+plot_df = (
+    cell_labels.copy()
+    .assign(
+        y=lambda d: np.random.normal(0, 0.5, len(d)),
+        x=lambda d: d["spot"] + np.random.uniform(-0.2, 0.2, len(d)),
+    )
+    .astype({"clone": "category"})
+)
+_, ax = plt.subplots(figsize=(10, 0.7))
+sns.scatterplot(
+    data=plot_df, x="x", y="y", hue="clone", ax=ax, alpha=0.8, edgecolor=None, s=25
+)
+for i in range(1, N_SPOTS):
+    ax.axvline(i - 0.5, lw=1, color="k")
+ax.set_xlim(-0.5, N_SPOTS - 0.5)
+ax.set_xlabel("spot")
+ax.set_ylabel(None)
+ax.set_yticks([])
+ax.legend(loc="lower left", bbox_to_anchor=(0, 1), title="clone", ncol=2)
+plt.show()
+```
+
+
+
+![png](tumoroscope_files/tumoroscope_45_0.png)
+
+
+
+
+```python
+_, ax = plt.subplots(figsize=(4, 3))
+sns.histplot(cell_counts.flatten(), binwidth=0.5, ax=ax)
+ax.set_xlabel("number of cells per spot")
+ax.set_ylabel("count")
+plt.show()
+```
+
+
+
+![png](tumoroscope_files/tumoroscope_46_0.png)
+
+
+
+
+```python
+cg = sns.clustermap(
+    clone_mutations.T, figsize=(6, 2), dendrogram_ratio=(0.1, 0.15), cmap="Greys"
+)
+cg.ax_heatmap.set_xlabel("position")
+cg.ax_heatmap.set_ylabel("clone")
+cg.ax_heatmap.set_xticklabels([])
+cg.ax_heatmap.tick_params("x", size=0)
+cg.ax_col_dendrogram.set_title("Mutations in clones")
+plt.show()
+```
+
+
+
+![png](tumoroscope_files/tumoroscope_47_0.png)
+
+
+
+The rate for the Poisson to randomly generate the number of total reads was set to achieve an average read count around 110 per spot.
+This was the highest read coverage reported for the simulations in the manuscript.
+
+
+```python
+np.random.seed(44)
+
+# Randomly assign zygosity per position for each clone, allowing
+# for copy number alterations.
+zygosity = (
+    np.random.choice([0.25, 0.5, 0.75, 1.0], size=(n_positions, N_CLONES))
+    * clone_mutations
+)
+
+alt_read_counts = np.zeros((n_positions, N_SPOTS, N_CLONES))
+tot_read_counts = np.zeros((n_positions, N_SPOTS, N_CLONES))
+
+clone_cell_counts_per_spot = (
+    cell_labels.groupby(["spot", "clone"])["cell"]
+    .count()
+    .reset_index()
+    .rename(columns={"cell": "n_cells"})
+)
+
+for _, row in clone_cell_counts_per_spot.iterrows():
+    clone_tot_reads = np.zeros(n_positions)
+    clone_alt_reads = np.zeros(n_positions)
+    for c in range(row["n_cells"]):
+        cell_tot_reads = np.random.poisson(1.7, size=n_positions)
+        cell_alt_reads = np.random.binomial(cell_tot_reads, zygosity[:, row["clone"]])
+        clone_tot_reads = clone_tot_reads + cell_tot_reads
+        clone_alt_reads = clone_alt_reads + cell_alt_reads
+    tot_read_counts[:, row["spot"], row["clone"]] = clone_tot_reads
+    alt_read_counts[:, row["spot"], row["clone"]] = clone_alt_reads
+
+alt_read_counts = alt_read_counts.sum(axis=2)
+tot_read_counts = tot_read_counts.sum(axis=2)
+
+avg_read_cts = np.median(tot_read_counts.sum(axis=0))
+print(f"average reads per spot: {round(avg_read_cts)}")
+```
+
+    average reads per spot: 113
+
+
+
+```python
+fig, axes = plt.subplots(ncols=2, figsize=(12, 5))
+sns.heatmap(tot_read_counts, cmap="Greys", ax=axes[0])
+axes[0].set_title("Total read counts")
+sns.heatmap(alt_read_counts, cmap="Greys", ax=axes[1])
+axes[1].set_title("Alternative read counts")
+
+for ax in axes:
+    ax.tick_params(size=0)
+    ax.set_xlabel("spot")
+    ax.set_ylabel("position")
+
+plt.show()
+```
+
+
+
+![png](tumoroscope_files/tumoroscope_50_0.png)
+
+
+
+
+```python
+real_sim_data = TumoroscopeData(
+    K=N_CLONES,
+    S=N_SPOTS,
+    M=n_positions,
+    F_0=1,
+    F=clone_proportions,
+    cell_counts=cell_counts,
+    C=zygosity,
+    D_obs=tot_read_counts,
+    A_obs=alt_read_counts,
+    zeta_s=N_CLONES * 2,
+    r=0.5,
+    p=1,
+)
+
+realsim_trace_fp = models_dir / "realistic-simulation-trace.netcdf"
+if False and realsim_trace_fp.exists():
+    print("Removing trace cache.")
+    os.remove(realsim_trace_fp)
+
+if realsim_trace_fp.exists():
+    print("Retrieving cached posterior.")
+    realsim_trace = az.from_netcdf(realsim_trace_fp)
+else:
+    with tumoroscope(real_sim_data, fixed=False):
+        realsim_trace = pm.sample(
+            draws=1000, tune=2000, chains=2, cores=2, random_seed=10, target_accept=0.95
+        )
+        pm.sample_posterior_predictive(
+            realsim_trace, random_seed=7348, extend_inferencedata=True
+        )
+    realsim_trace.to_netcdf(realsim_trace_fp)
+```
+
+    Retrieving cached posterior.
+
+
+
+```python
+fig, axes = plt.subplots(
+    nrows=real_sim_data.K, figsize=(5, 2.5 * real_sim_data.K), sharex=True
+)
+for clone_i, ax in enumerate(axes.flatten()):
+    clone = f"c{clone_i}"
+    ax.set_title(f"clone {clone}")
+
+    # Plot true fraction of clones at each spot.
+    true_clone_frac = cell_labels.groupby(["spot"])["clone"].apply(
+        _frac_clone, k=clone_i
+    )
+    ax.scatter(
+        true_clone_frac.index.tolist(),
+        true_clone_frac.values.tolist(),
+        c="tab:blue",
+        s=8,
+        zorder=10,
+    )
+
+    # Plot population fraction.
+    ax.axhline(real_sim_data.F[clone_i], lw=0.8, c="k", ls="--")
+
+    # Plot posterior.
+    H = realsim_trace.posterior["H"].sel(clone=[clone])
+    dx = np.linspace(-0.1, 0.1, len(H.coords["chain"]))
+    spot = np.arange(real_sim_data.S)
+    for chain in H.coords["chain"]:
+        _x = spot + dx[chain]
+        ax.scatter(_x, H.sel(chain=chain).mean(axis=(0)), c="tab:red", s=2, zorder=20)
+        _hdi = az.hdi(H, coords={"chain": [chain]})["H"].values.squeeze()
+        ax.vlines(
+            x=_x, ymin=_hdi[:, 0], ymax=_hdi[:, 1], lw=0.5, zorder=10, color="tab:red"
+        )
+    ax.set_ylabel("proportion of cells")
+    ax.set_xlabel(None)
+
+axes[-1].set_xlabel("spot")
+fig.tight_layout()
+plt.show()
+```
+
+
+
+![png](tumoroscope_files/tumoroscope_52_0.png)
+
+
+
 ---
 
 ## Session information
@@ -875,7 +1142,7 @@ fig.tight_layout()
 %watermark -d -u -v -iv -b -h -m
 ```
 
-    Last updated: 2022-10-11
+    Last updated: 2022-10-13
 
     Python implementation: CPython
     Python version       : 3.10.6
@@ -891,16 +1158,16 @@ fig.tight_layout()
 
     Hostname: JHCookMac.local
 
-    Git branch: tumoroscope-tweaks
+    Git branch: complex-simulation
 
+    aesara    : 2.8.6
+    pandas    : 1.5.0
     pymc      : 4.2.1
     seaborn   : 0.12.0
-    pandas    : 1.5.0
-    numpy     : 1.23.3
-    matplotlib: 3.6.0
     arviz     : 0.12.1
+    matplotlib: 3.6.0
+    numpy     : 1.23.3
     janitor   : 0.22.0
-    aesara    : 2.8.6
     scipy     : 1.9.1
 
 
